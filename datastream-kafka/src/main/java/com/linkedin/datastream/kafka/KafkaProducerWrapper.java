@@ -5,6 +5,7 @@
  */
 package com.linkedin.datastream.kafka;
 
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -12,15 +13,24 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
+import kafka.Kafka;
+import org.apache.commons.lang.exception.ExceptionUtils;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
@@ -59,6 +69,7 @@ class KafkaProducerWrapper<K, V> {
 
   private static final int TIME_OUT = 2000;
   private static final int MAX_SEND_ATTEMPTS = 10;
+  private static final int PRODUCE_TIME_OUT = 5000;
   private final Logger _log;
   private final long _sendFailureRetryWaitTimeMs;
 
@@ -96,6 +107,23 @@ class KafkaProducerWrapper<K, V> {
 
   private final DynamicMetricsManager _dynamicMetricsManager;
   private final String _metricsNamesPrefix;
+
+  private static final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1,
+      new ThreadFactoryBuilder().setDaemon(true).setNameFormat("failAfter-%d").build());
+
+  public static <T> CompletableFuture<T> failAfter(Duration duration) {
+    final CompletableFuture<T> promise = new CompletableFuture<>();
+    scheduler.schedule(() -> {
+      final TimeoutException ex = new TimeoutException(String.format("Timeout after {}", duration));
+      return promise.completeExceptionally(ex);
+    }, duration.toMillis(), TimeUnit.MILLISECONDS);
+    return promise;
+  }
+
+  public static <T> CompletableFuture<T> within(CompletableFuture<T> future, Duration duration) {
+    CompletableFuture<T> timeout = failAfter(duration);
+    return future.applyToEither(timeout, Function.identity());
+  }
 
   KafkaProducerWrapper(String logSuffix, Properties props) {
     this(logSuffix, props, null);
@@ -182,52 +210,85 @@ class KafkaProducerWrapper<K, V> {
 
   void send(DatastreamTask task, ProducerRecord<K, V> producerRecord, Callback onComplete)
       throws InterruptedException {
+
     // There are two known cases that lead to IllegalStateException and we should retry:
     //  1) number of brokers is less than minISR
     //  2) producer is closed in generateSendFailure by another thread
     // For either condition, we should retry as broker comes back healthy or producer is recreated
+
     boolean retry = true;
-    int numberOfAttempt = 0;
+    int numberOfAttempts = 0;
     while (retry) {
       try {
-        ++numberOfAttempt;
-        maybeGetKafkaProducer(task).ifPresent(p -> p.send(producerRecord, (metadata, exception) -> {
-          if (exception == null) {
-            onComplete.onCompletion(metadata, null);
-          } else {
-            onComplete.onCompletion(metadata, generateSendFailure(exception));
-          }
-        }));
+        numberOfAttempts++;
+
+        maybeGetKafkaProducer(task)
+            .ifPresent(p -> produceMessage(p, producerRecord)
+                .thenAccept(m -> onComplete.onCompletion(m, null)));
 
         retry = false;
-      } catch (IllegalStateException e) {
-        //The following exception should be quite rare as most exceptions will be throw async callback
-        _log.warn("Either send is called on a closed producer or broker count is less than minISR, retry in {} ms.",
-            _sendFailureRetryWaitTimeMs, e);
-        Thread.sleep(_sendFailureRetryWaitTimeMs);
-      } catch (TimeoutException e) {
-        _log.warn("Kafka producer buffer is full, retry in {} ms.", _sendFailureRetryWaitTimeMs, e);
-        Thread.sleep(_sendFailureRetryWaitTimeMs);
-      } catch (KafkaException e) {
-        Throwable cause = e.getCause();
-        while (cause instanceof KafkaException) {
-          cause = cause.getCause();
-        }
-        // Set a max_send_attempts for KafkaException as it may be non-recoverable
-        if (numberOfAttempt > MAX_SEND_ATTEMPTS || ((cause instanceof Error || cause instanceof RuntimeException))) {
-          _log.error("Send failed for partition {} with a non retriable exception", producerRecord.partition(), e);
-          throw generateSendFailure(e);
+      } catch (CompletionException completionEx) {
+        Throwable cause = completionEx.getCause();
+
+        if (cause instanceof TimeoutException) {
+          _log.warn("Kafka client was unable to send a message to the destination topic. The request has timed out. "
+              + "The topic may no longer be available.");
+          throw new DatastreamTransientException(cause);
         } else {
-          _log.warn("Send failed for partition {} with retriable exception, retry {} out of {} in {} ms.",
-              producerRecord.partition(), numberOfAttempt, MAX_SEND_ATTEMPTS, _sendFailureRetryWaitTimeMs, e);
-          Thread.sleep(_sendFailureRetryWaitTimeMs);
+          KafkaClientException ex = (KafkaClientException)cause.getCause();
+
+          if (ex.doPropagate()) {
+            onComplete.onCompletion(ex.getMetadata(), generateSendFailure(ex.getCause()));
+          }
+
+          Throwable innerException = ex.getCause();
+          if(innerException instanceof TimeoutException) {
+            _log.warn("Kafka producer buffer is full, retry in {} ms.", _sendFailureRetryWaitTimeMs, innerException);
+            Thread.sleep(_sendFailureRetryWaitTimeMs);
+          } else if(innerException instanceof IllegalStateException) {
+            // The following exception should be quite rare as most exceptions will be throw async callback
+            _log.warn("Either send is called on a closed producer or broker count is less than minISR, retry in {} ms.",
+                _sendFailureRetryWaitTimeMs, innerException);
+          } else if(innerException instanceof KafkaException) {
+            Throwable rootCause = ExceptionUtils.getRootCause(innerException);
+
+            if (numberOfAttempts > MAX_SEND_ATTEMPTS ||
+                (rootCause instanceof Error || rootCause instanceof RuntimeException)) {
+              // Set a max_send_attempts for KafkaException as it may be non-recoverable
+              _log.error("Send failed for partition {} with a non retriable exception", producerRecord.partition(),
+                  innerException);
+              throw generateSendFailure(innerException);
+            } else {
+              // The exception might be recoverable. Retry will be attempted
+              _log.warn("Send failed for partition {} with retriable exception, retry {} out of {} in {} ms.",
+                  producerRecord.partition(), numberOfAttempts, MAX_SEND_ATTEMPTS, _sendFailureRetryWaitTimeMs,
+                  innerException);
+              Thread.sleep(_sendFailureRetryWaitTimeMs);
+            }
+          } else throw generateSendFailure(innerException);
         }
-      } catch (Exception e) {
-        _log.error("Send failed for partition {} with an exception", producerRecord.partition(), e);
-        throw generateSendFailure(e);
       }
     }
   }
+
+  private CompletableFuture<RecordMetadata> produceMessage(Producer<K, V> producer, ProducerRecord<K, V> record) {
+    CompletableFuture<RecordMetadata> future = new CompletableFuture<>();
+
+    try {
+      producer.send(record, (metadata, exception) -> {
+        if (exception == null) {
+          future.complete(metadata);
+        } else {
+          future.completeExceptionally(new KafkaClientException(metadata, exception, true));
+        }
+      });
+    } catch (Exception ex) {
+      future.completeExceptionally(new KafkaClientException(null, ex));
+    }
+
+    return within(future, Duration.ofMillis(PRODUCE_TIME_OUT));
+  }
+
 
   private synchronized void shutdownProducer() {
     Producer<K, V> producer = _kafkaProducer;
@@ -240,7 +301,7 @@ class KafkaProducerWrapper<K, V> {
     }
   }
 
-  private DatastreamRuntimeException generateSendFailure(Exception exception) {
+  private DatastreamRuntimeException generateSendFailure(Throwable exception) {
     _dynamicMetricsManager.createOrUpdateMeter(_metricsNamesPrefix, AGGREGATE, PRODUCER_ERROR, 1);
     if (exception instanceof IllegalStateException) {
       _log.warn("sent failure transiently, exception: ", exception);
