@@ -6,21 +6,12 @@ public class KafkaClientException extends Exception {
 
   private final RecordMetadata _metadata;
 
-  private final boolean _propagate;
-
   public RecordMetadata getMetadata() {
     return _metadata;
   }
 
-  public boolean doPropagate() { return _propagate; }
-
-  public KafkaClientException(RecordMetadata metadata, Throwable innerException, boolean propagate) {
+  public KafkaClientException(RecordMetadata metadata, Throwable innerException) {
     super(innerException);
     _metadata = metadata;
-    _propagate = propagate;
-  }
-
-  public KafkaClientException(RecordMetadata metadata, Throwable innerException) {
-    this(metadata, innerException, false);
   }
 }
