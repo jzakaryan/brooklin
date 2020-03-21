@@ -5,7 +5,7 @@
  */
 package com.linkedin.datastream.kafka;
 
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import com.linkedin.datastream.common.CompletableFutureUtils;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -15,11 +15,8 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Function;
 import java.util.function.Supplier;
 
 import org.apache.commons.lang.exception.ExceptionUtils;
@@ -66,7 +63,8 @@ class KafkaProducerWrapper<K, V> {
 
   private static final int TIME_OUT = 2000;
   private static final int MAX_SEND_ATTEMPTS = 10;
-  private static final int PRODUCE_TIME_OUT = 60000;
+  private static final int SEND_TIME_OUT = 5000;
+  private static final int FLUSH_TIME_OUT = 10 * 60 * 1000;
   private final Logger _log;
   private final long _sendFailureRetryWaitTimeMs;
 
@@ -104,23 +102,6 @@ class KafkaProducerWrapper<K, V> {
 
   private final DynamicMetricsManager _dynamicMetricsManager;
   private final String _metricsNamesPrefix;
-
-  private static final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1,
-      new ThreadFactoryBuilder().setDaemon(true).setNameFormat("failAfter-%d").build());
-
-  public static <T> CompletableFuture<T> failAfter(Duration duration) {
-    final CompletableFuture<T> promise = new CompletableFuture<>();
-    scheduler.schedule(() -> {
-      OperationTimeoutException ex = new OperationTimeoutException(String.format("Timeout after {}", duration));
-      return promise.completeExceptionally(ex);
-    }, duration.toMillis(), TimeUnit.MILLISECONDS);
-    return promise;
-  }
-
-  public static <T> CompletableFuture<T> within(CompletableFuture<T> future, Duration duration) {
-    CompletableFuture<T> timeout = failAfter(duration);
-    return future.applyToEither(timeout, Function.identity());
-  }
 
   KafkaProducerWrapper(String logSuffix, Properties props) {
     this(logSuffix, props, null);
@@ -221,15 +202,16 @@ class KafkaProducerWrapper<K, V> {
         numberOfAttempts++;
 
         maybeGetKafkaProducer(task).ifPresent(
-            p -> within(produceMessage(p, producerRecord), Duration.ofMillis(PRODUCE_TIME_OUT))
+            p -> CompletableFutureUtils.within(produceMessage(p, producerRecord), Duration.ofMillis(SEND_TIME_OUT))
                 .thenAccept(m -> onComplete.onCompletion(m, null))
                 .exceptionally(completionEx -> {
                   Throwable cause = completionEx.getCause();
                   if (cause instanceof KafkaClientException) {
                     KafkaClientException ex = (KafkaClientException) cause;
                     onComplete.onCompletion(ex.getMetadata(), (Exception) ex.getCause());
-                  } else if (cause instanceof OperationTimeoutException) {
-                    onComplete.onCompletion(null, (OperationTimeoutException) cause);
+                  } else if (cause instanceof java.util.concurrent.TimeoutException) {
+                    _log.warn("KafkaProducerWrapper send timed out. The destination topic may be unavailable.");
+                    onComplete.onCompletion(null, (java.util.concurrent.TimeoutException) cause);
                   }
                   return null;
                 }));
@@ -301,7 +283,8 @@ class KafkaProducerWrapper<K, V> {
 
   synchronized void flush() {
     if (_kafkaProducer != null) {
-      _kafkaProducer.flush();
+      CompletableFutureUtils.within(CompletableFuture.runAsync(() -> _kafkaProducer.flush()),
+          Duration.ofMillis(FLUSH_TIME_OUT)).join();
     }
   }
 
