@@ -42,7 +42,6 @@ import com.linkedin.datastream.server.DatastreamTaskImpl;
 import com.linkedin.datastream.server.api.transport.TransportProvider;
 import com.linkedin.datastream.testutil.BaseKafkaZkTest;
 import com.linkedin.datastream.testutil.DatastreamTestUtils;
-import sun.reflect.generics.reflectiveObjects.NotImplementedException;
 
 import static org.mockito.Mockito.mock;
 
@@ -204,11 +203,6 @@ public class TestKafkaTransportProvider extends BaseKafkaZkTest {
   @Test
   public void testEventWithoutKeyValueAndPartition() throws Exception {
     testEventSend(1, 2, -1, false, false, "test");
-  }
-
-  @Test
-  public void testSendIsInterruptedWhenDestinationIsUnavailable() throws Exception {
-    throw new NotImplementedException();
   }
 
   @Test

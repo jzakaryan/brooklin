@@ -5,7 +5,6 @@
  */
 package com.linkedin.datastream.kafka;
 
-import com.linkedin.datastream.common.CompletableFutureUtils;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -35,6 +34,7 @@ import org.slf4j.LoggerFactory;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.RateLimiter;
 
+import com.linkedin.datastream.common.CompletableFutureUtils;
 import com.linkedin.datastream.common.DatastreamRuntimeException;
 import com.linkedin.datastream.common.DatastreamTransientException;
 import com.linkedin.datastream.common.ReflectionUtils;

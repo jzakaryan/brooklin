@@ -1,8 +1,14 @@
+/**
+ *  Copyright 2020 LinkedIn Corporation. All rights reserved.
+ *  Licensed under the BSD 2-Clause License. See the LICENSE file in the project root for license information.
+ *  See the NOTICE file in the project root for additional information regarding copyright ownership.
+ */
 package com.linkedin.datastream.common;
 
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
+
 import org.apache.commons.lang.NullArgumentException;
 import org.testng.Assert;
 import org.testng.annotations.Test;
